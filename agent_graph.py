@@ -222,12 +222,18 @@ def expert_analyst_node(state: WildfireState):
     - Focos Confirmados (Filtro Térmico > 315K): {count}.
     - Coordenadas de exemplo (Lat/Lon/Temp): {coords}
     
-    Gere um parecer técnico curto (3 parágrafos) sobre a situação.
-    1. Analise a severidade (baseado na contagem confirmada).
-    2. Comente sobre a possível presença de falsos positivos nos dados brutos.
-    3. Recomende ações para a defesa civil do Ceará.
+    Gere um relatório técnico contendo:
     
-    Se houver 0 focos confirmados, diga que não há riscos identificados.
+    1. **Parecer Situacional**: 
+       - Analise a severidade com base nos focos confirmados.
+       - Recomende ações para a defesa civil.
+       
+    2. **Justificativa Metodológica** (Obrigatório, abaixo do parecer):
+       - Explique que foi usada a técnica de **Aprendizado de Máquina Não-Supervisionado (K-Means)** para segmentar a imagem termal.
+       - Explique que um **Filtro Estatístico de Temperatura (>315K)** foi aplicado sobre o cluster quente para remover falsos positivos (solo aquecido vs fogo ativo).
+       - Caso haja erros ou 0 focos, analise se pode ser cobertura de nuvens ou ausência real de calor.
+       
+    Mantenha o tom profissional e direto.
     """
     
     response = llm.invoke([HumanMessage(content=prompt)])

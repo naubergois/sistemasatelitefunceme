@@ -55,12 +55,14 @@ if st.sidebar.button("🚀 Iniciar Análise Especialista"):
                         st.warning("Mapa não gerado.")
                         
                 with col2:
-                    st.subheader("Parecer Técnico (IA)")
+                    st.subheader("Relatório & Justificativa")
                     report = result.get("analyst_report", "Parecer indisponível.")
-                    st.info(report)
+                    with st.container(border=True):
+                        st.markdown(report)
                     
-                    st.metric("Anomalias Brutas (Cluster)", result.get("raw_anomalies", 0))
-                    st.metric("Focos Confirmados (>315K)", result.get("confirmed_anomalies", 0))
+                    st.divider()
+                    st.metric("Anomalias Brutas (Cluster)", result.get("raw_anomalies", 0), help="Total de pixels no cluster mais quente (inclui solo quente)")
+                    st.metric("Focos Confirmados (>315K)", result.get("confirmed_anomalies", 0), help="Pixels filtrados com alta probabilidade de fogo")
 
         except Exception as e:
             st.error(f"Falha Crítica: {str(e)}")
