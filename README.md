@@ -25,7 +25,7 @@ Este projeto é um sistema avançado de monitoramento de incêndios florestais f
 1.  **Clone o repositório:**
     ```bash
     git clone https://github.com/naubergois/sistemasatelitefunceme.git
-    cd monitor-queimadas-ceara
+    cd sistemasatelitefunceme
     ```
 
 2.  **Crie e ative um ambiente virtual:**
