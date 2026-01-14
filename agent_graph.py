@@ -205,15 +205,31 @@ def map_generation_node(state: WildfireState):
 
 def expert_analyst_node(state: WildfireState):
     """Generates a text report using an LLM."""
-    """Generates a text report using an LLM."""
-    # We DO NOT skip if error, we want to report it!
-    # if state.get("error"): return state
-
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5)
-    
-    count = state["confirmed_anomalies"]
-    raw = state["raw_anomalies"]
-    coords = state["fire_coordinates"][:5] # Sample for context
+
+    # 1. Handle Error State
+    if state.get("error"):
+        error_msg = state["error"]
+        prompt = f"""
+        Você é um especialista em monitoramento de queimadas via satélite (GOES-16).
+        
+        Tivemos um problema ao processar os dados para a data: {state.get('date_query', 'Desconhecida')}.
+        Erro reportado: "{error_msg}"
+        
+        Sua tarefa é JUSTIFICAR esse erro para o usuário final em um parágrafo técnico.
+        - Se o erro for sobre "No data found", considere se a data solicitada (Ex: 2026) está no futuro ou se o dataset do satélite tem delay.
+        - Explique que o sistema tentou buscar no bucket AWS S3 'noaa-goes16', mas falhou.
+        
+        Termine com uma **Justificativa Metodológica** explicando que o acesso aos dados depende da disponibilidade no provedor (NOAA) e que datas futuras ou muito recentes podem ainda não ter sido processadas (latência de ingestão).
+        """
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"analyst_report": response.content, "error": None}
+
+    # 2. Handle Success State
+    # Safely get values, defaulting to 0/empty if somehow missing but no error flag
+    count = state.get("confirmed_anomalies", 0)
+    raw = state.get("raw_anomalies", 0)
+    coords = state.get("fire_coordinates", [])[:5]
     
     prompt = f"""
     Você é um especialista em monitoramento de queimadas via satélite (GOES-16).
@@ -236,26 +252,6 @@ def expert_analyst_node(state: WildfireState):
        
     Mantenha o tom profissional e direto.
     """
-    
-    # Handle ERROR State specially
-    if state.get("error"):
-        error_msg = state["error"]
-        prompt = f"""
-        Você é um especialista em monitoramento de queimadas via satélite (GOES-16).
-        
-        Tivemos um problema ao processar os dados para a data: {state['date_query']}.
-        Erro reportado: "{error_msg}"
-        
-        Sua tarefa é JUSTIFICAR esse erro para o usuário final em um parágrafo técnico.
-        - Se o erro for sobre "No data found", considere se a data solicitada (Ex: 2026) está no futuro ou se o dataset do satélite tem delay.
-        - Explique que o sistema tentou buscar no bucket AWS S3 'noaa-goes16', mas falhou.
-        
-        Termine com uma **Justificativa Metodológica** explicando que o acesso aos dados depende da disponibilidade no provedor (NOAA) e que datas futuras ou muito recentes podem ainda não ter sido processadas (latência de ingestão).
-        """
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    # Return report AND clear error so dashboard shows success with the report text
-    return {"analyst_report": response.content, "error": None}
     
     response = llm.invoke([HumanMessage(content=prompt)])
     return {"analyst_report": response.content}
