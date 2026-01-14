@@ -2,6 +2,8 @@
 
 Este projeto é um sistema avançado de monitoramento de incêndios florestais focado no estado do Ceará, Brasil. Ele utiliza dados brutos do satélite GOES-16 (NOAA), processamento de imagens com Inteligência Artificial Não-Supervisionada (K-Means) e um agente especialista baseado em LangGraph para orquestração e análise.
 
+![Diagrama do Sistema](diagrama_funceme.jpg)
+
 ## 🚀 Funcionalidades
 
 1.  **Coleta de Dados de Satélite**: Download automático de bandas espectrais (07 - Infravermelho Curto e 13 - Infravermelho Limpo) do bucket AWS S3 do NOAA (`noaa-goes16`).
