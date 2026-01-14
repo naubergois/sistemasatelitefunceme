@@ -13,3 +13,5 @@ streamlit
 langgraph
 geopandas
 shapely
+geopy
+rtree

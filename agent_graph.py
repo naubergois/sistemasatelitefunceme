@@ -7,10 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pyproj
 import traceback
+import io
 
 from datetime import datetime
 from netCDF4 import Dataset
-from shapely.geometry import box
+from shapely.geometry import Point
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from typing import TypedDict, List, Annotated
@@ -19,6 +20,7 @@ import operator
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
+from geopy.distance import geodesic
 
 # Import the existing download tool
 from queimadas_goes16 import download_goes_data
@@ -27,6 +29,29 @@ from queimadas_goes16 import download_goes_data
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("wildfire_graph")
 
+# --- STATIC DATA: FIRE STATIONS (CBMCE) ---
+# Coordinates approximated for major battalions
+CBMCE_STATIONS = {
+    "1ª Cia/1º BBM - Fortaleza (Jacarecanga)": (-3.722, -38.538),
+    "2ª Cia/1º BBM - Fortaleza (Mucuripe)": (-3.725, -38.480),
+    "1ª Cia/3º BBM - Sobral": (-3.688, -40.349),
+    "2ª Cia/3º BBM - Tianguá": (-3.731, -40.993),
+    "1ª Cia/4º BBM - Iguatu": (-6.368, -39.303),
+    "1ª Cia/5º BBM - Juazeiro do Norte": (-7.221, -39.328),
+    "2ª Cia/5º BBM - Crato": (-7.234, -39.412),
+    "1ª Cia/BCIF - Quixadá": (-4.970, -39.016),
+    "2ª Cia/BCIF - Quixeramobim": (-5.197, -39.294),
+    "3ª Cia/BCIF - Canindé": (-4.358, -39.313),
+    "1ª Cia/2º BBM - Maracanaú": (-3.876, -38.626),
+    "2ª Cia/2º BBM - Horizonte": (-4.095, -38.490),
+    "3ª Cia/2º BBM - Caucaia": (-3.737, -38.653),
+    "2ª Cia/4º BBM - Limoeiro do Norte": (-5.147, -38.098),
+    "3ª Cia/4º BBM - Aracati": (-4.561, -37.767),
+    "2ª Cia/3º BBM - Crateús": (-5.176, -40.668),
+    "3ª Cia/3º BBM - Tauá": (-6.002, -40.293),
+    "4ª Cia/3º BBM - Itapipoca": (-3.494, -39.586)
+}
+
 # --- STATE DEFINITION ---
 class WildfireState(TypedDict):
     date_query: str
@@ -34,6 +59,7 @@ class WildfireState(TypedDict):
     raw_anomalies: int
     confirmed_anomalies: int
     fire_coordinates: List[tuple] # [(lat, lon, temp), ...]
+    enriched_data: List[dict] # [{lat, lon, city, region, station, dist_km}, ...]
     map_image_path: str
     analyst_report: str
     error: str
@@ -45,7 +71,6 @@ def fetch_data_node(state: WildfireState):
     query = state["date_query"]
     logger.info(f"Fetching data for: {query}")
     try:
-        # download_goes_data returns a JSON string, need to parse it
         result_json = download_goes_data.invoke({"query": query})
         if "Erro" in result_json and not result_json.strip().startswith("{"):
             return {"error": result_json}
@@ -56,201 +81,250 @@ def fetch_data_node(state: WildfireState):
         return {"error": str(e)}
 
 def refine_detection_node(state: WildfireState):
-    """Runs K-Means but filters for high temperature to reduce false positives."""
-    if state.get("error"):
-        return state
+    """Runs K-Means filters for high temperature."""
+    if state.get("error"): return state
 
     paths = state["nc_paths"]
     try:
-        nc07 = Dataset(paths['b07'])
-        nc13 = Dataset(paths['b13'])
-        t07 = nc07.variables['CMI'][:]
-        t13 = nc13.variables['CMI'][:]
+        nc07 = Dataset(paths['b07']); nc13 = Dataset(paths['b13'])
+        t07 = nc07.variables['CMI'][:]; t13 = nc13.variables['CMI'][:]
         
         # Georeferencing
         proj_var = nc07.variables['goes_imager_projection']
         h = proj_var.perspective_point_height
         lon_0 = proj_var.longitude_of_projection_origin
         p = pyproj.Proj(proj='geos', h=h, lon_0=lon_0, sweep='x')
-        x = nc07.variables['x'][:] * h
-        y = nc07.variables['y'][:] * h
+        x = nc07.variables['x'][:] * h; y = nc07.variables['y'][:] * h
         xx, yy = np.meshgrid(x, y)
         lons, lats = p(xx, yy, inverse=True)
         
         # Ceará Mask
         mask_ceara = (lats >= -7.9) & (lats <= -2.7) & (lons >= -41.5) & (lons <= -37.1)
-        
-        if not np.any(mask_ceara):
-            return {"error": "No pixels inside Ceará bounding box."}
+        if not np.any(mask_ceara): return {"error": "No pixels inside Ceará bounding box."}
 
         # Feature Extraction
         features_b07 = t07[mask_ceara].flatten()
         features_b13 = t13[mask_ceara].flatten()
         valid = ~np.isnan(features_b07) & ~np.isnan(features_b13)
-        
-        X = np.column_stack((
-            features_b07[valid], 
-            features_b13[valid],
-            (features_b07 - features_b13)[valid]
-        ))
+        X = np.column_stack((features_b07[valid], features_b13[valid], (features_b07 - features_b13)[valid]))
         
         # K-Means
         kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
         labels = kmeans.fit_predict(StandardScaler().fit_transform(X))
         
-        # Identify Fire Cluster (Highest Avg Temp)
+        # Fire Cluster
         means = [np.mean(X[labels == i, 0]) for i in range(4)]
         fire_cluster_id = np.argmax(means)
         raw_count = np.sum(labels == fire_cluster_id)
         
-        # REFINEMENT: Filter points in the fire cluster that are actually HOT
-        # Statistical Threshold: Mean + 1 StdDev OR Absolute > 310K
-        # Choosing Absolute > 310K (approx 37°C) to remove warm ground
-        # Note: B07 is Shortwave IR, heavily acted by sun reflection. 
-        # Using a combination of simple threshold on top of the cluster.
-        
+        # Strict Filter (>315K)
         fire_indices = (labels == fire_cluster_id)
-        # Get actual indices in the X array
-        temps_in_cluster = X[fire_indices, 0] # B07 temps
-        
-        # Strict Filter: Must be > 315K (42°C brightness temp) to be reasonably sure it's fire/hotspot
-        # AND check difference > 10K
+        temps_in_cluster = X[fire_indices, 0]
         diffs_in_cluster = X[fire_indices, 2]
-        
         strict_mask = (temps_in_cluster > 315) & (diffs_in_cluster > 5)
         confirmed_count = np.sum(strict_mask)
         
-        # Extract Coordinates of Confirmed Fires
-        # This is tricky because we flattened constraints.
-        # We need to map back to lat/lon.
+        # Coordinates
+        ceara_lats = lats[mask_ceara].flatten()[valid][fire_indices]
+        ceara_lons = lons[mask_ceara].flatten()[valid][fire_indices]
         
-        # 1. Full mask of valid pixels in Ceara
-        ceara_lats = lats[mask_ceara].flatten()[valid]
-        ceara_lons = lons[mask_ceara].flatten()[valid]
+        final_lats = ceara_lats[strict_mask]
+        final_lons = ceara_lons[strict_mask]
+        final_temps = temps_in_cluster[strict_mask]
         
-        # 2. Subsection of those that are in fire cluster
-        cluster_lats = ceara_lats[fire_indices]
-        cluster_lons = ceara_lons[fire_indices]
-        cluster_temps = temps_in_cluster
+        # Sample for next steps (Enrich max 10 points to avoid strict API limits/delays)
+        # We prioritize the HOTTEST ones.
+        sorted_indices = np.argsort(final_temps)[::-1] # Descending temp
         
-        # 3. Subsection that passed strict filter
-        final_lats = cluster_lats[strict_mask]
-        final_lons = cluster_lons[strict_mask]
-        final_temps = cluster_temps[strict_mask]
-        
-        # Sample coordinates (up to 100 to avoid state bloat)
         coords = []
-        for i in range(min(len(final_lats), 100)):
-            coords.append((float(final_lats[i]), float(final_lons[i]), float(final_temps[i])))
+        limit = min(len(final_lats), 10) # Enriched sample limit
+        
+        for i in range(limit):
+             idx = sorted_indices[i]
+             coords.append((float(final_lats[idx]), float(final_lons[idx]), float(final_temps[idx])))
             
         nc07.close(); nc13.close()
         
         return {
             "raw_anomalies": int(raw_count),
             "confirmed_anomalies": int(confirmed_count),
-            "fire_coordinates": coords
+            "fire_coordinates": coords # Only pass the hottest sample for enrichment
         }
         
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
-def map_generation_node(state: WildfireState):
-    """Generates the map using Geopandas and IBGE shapefiles."""
-    if state.get("error"):
-        return state
-
+def enrich_location_node(state: WildfireState):
+    """Identifies municipalities and nearest fire stations."""
+    if state.get("error") or not state.get("fire_coordinates"):
+        return {"enriched_data": []}
+    
     try:
-        # Download Ceará Shapefile from IBGE (GeoJSON)
-        url = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima"
+        # Download Ceará Municipalities (IBGE) - GeoJSON
+        url = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima&divisao=municipio"
         
-        # Download content properly to handle URL parameters that might confuse GDAL
-        import io
+        # Download and Cache in memory variable for optimization (in graph execution context, we re-download, ideally cache globally)
+        # For this script we download.
         response = requests.get(url)
         response.raise_for_status()
+        gdf_cities = gpd.read_file(io.BytesIO(response.content))
         
-        # Load from bytes
+        enriched_list = []
+        
+        for (lat, lon, temp) in state["fire_coordinates"]:
+            point = Point(lon, lat)
+            
+            # 1. Identify City
+            # Optimized: Check within bounding box first or just iterate. 
+            # Since number of cities is small (184), simple iteration is fine or sjoin if we made a GDF of points.
+            # Let's use simple iteration for the few points we have.
+            
+            city_name = "Desconhecido (Zona Rural/Mar)"
+            region_name = "N/A" # Macroregion info would need another shapefile/join, assuming just city for now.
+            
+            # Check contains
+            # GDF index is usually feature index, 'name' might be in columns
+            # IBGE usually returns 'codarea' and potentially 'name' if requested or we need to merge.
+            # The IBGE GeoJSON often has just geometries. Let's inspect column names dynamically if possible or assume logic.
+            # Actually IBGE "malhas" endpoint usually gives just geometry matching iso codes unless "nome" is requested in a specific way?
+            # It seems IBGE Malhas V3 returns properties: {codarea: "..."}
+            # We might need to fetch names separately or use a different endpoint that includes attributes.
+            # Alternative: "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima" gives the state.
+            # To get names we might need to query the localities API.
+            # For simplicity in this demo, if names are missing, we will report "Município ID: X".
+            # Update: GeoPandas read_file from that URL usually gets 'codarea'.
+            
+            match = gdf_cities[gdf_cities.contains(point)]
+            if not match.empty:
+                # Try to find a name column. If not, use the first column.
+                # In IBGE malhas, often we get just the code. We can try to look it up? 
+                # Or use a geocoding lib. Reverse geocoding with geopy/Nominatim is an option but rate limited.
+                # Let's try Nominatim for the 10 points. It's cleaner.
+                
+                from geopy.geocoders import Nominatim
+                geolocator = Nominatim(user_agent="ceara_wildfire_monitor")
+                try:
+                    location = geolocator.reverse(f"{lat}, {lon}", exactly_one=True, language='pt')
+                    if location:
+                        address = location.raw.get('address', {})
+                        city_name = address.get('city') or address.get('town') or address.get('village') or "Desconhecido"
+                        region_name = address.get('state_district', 'Ceará')
+                except:
+                    city_name = f"Município (ID {match.iloc[0].values[0]})"
+            
+            # 2. Nearest Fire Station
+            min_dist = float('inf')
+            nearest_station = "N/A"
+            
+            for station, (slat, slon) in CBMCE_STATIONS.items():
+                dist = geodesic((lat, lon), (slat, slon)).km
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest_station = station
+            
+            enriched_list.append({
+                "lat": lat, "lon": lon, "temp_k": temp,
+                "city": city_name, "region": region_name,
+                "station": nearest_station, "dist_km": round(min_dist, 1)
+            })
+            
+        return {"enriched_data": enriched_list}
+        
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": f"Enrichment Error: {str(e)}"}
+
+def map_generation_node(state: WildfireState):
+    """Generates the map using Geopandas."""
+    if state.get("error"): return state
+
+    try:
+        url = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima"
+        response = requests.get(url)
         gdf_ce = gpd.read_file(io.BytesIO(response.content))
         
         fig, ax = plt.subplots(figsize=(10, 8))
         gdf_ce.plot(ax=ax, color='white', edgecolor='black')
         
-        # Plot Anomalies
-        coords = state["fire_coordinates"]
+        # Plot Fire Points
+        coords = state.get("fire_coordinates", [])
         if coords:
             lats = [c[0] for c in coords]
             lons = [c[1] for c in coords]
-            # Verify if there are too many points to plot
-            confirmed_count = state["confirmed_anomalies"]
+            ax.scatter(lons, lats, c='red', marker='x', s=50, label='Focos (>315K)')
             
-            # If we have many points, we might just plot the ones we sampled or full scatter if we passed them all
-            # In refine_node we passed up to 100. Let's fix refine_node to pass ALL lats/lons for plotting if possible?
-            # Passing 100 is good for text analysis, but for map we might want all.
-            # For now, let's plot the sample (it represents the hottest ones if sorted? We didn't sort. Let's assume random sample or first ones)
+            # Also plot the nearest fire stations for the TOP 3 hottest (to avoid clutter)
+            enriched = state.get("enriched_data", [])
+            for item in enriched[:3]:
+                # Locate station coord
+                st_name = item['station']
+                if st_name in CBMCE_STATIONS:
+                    slat, slon = CBMCE_STATIONS[st_name]
+                    ax.scatter(slon, slat, c='blue', marker='o', s=40)
+                    # Draw line
+                    ax.plot([item['lon'], slon], [item['lat'], slat], 'g--', linewidth=0.5, alpha=0.7)
             
-            # Better: Plot the sample we have
-            ax.scatter(lons, lats, c='red', marker='x', s=30, label='Focos Confirmados (>315K)')
             plt.legend()
             
-        ax.set_title(f"Monitoramento de Queimadas - Ceará\nFocos Confirmados: {state['confirmed_anomalies']}")
+        ax.set_title(f"Queimadas Ceará + Unidades CBMCE\nFocos Confirmados: {state['confirmed_anomalies']}")
         
         output_path = "mapa_langgraph_ceara.png"
         plt.savefig(output_path)
         plt.close()
-        
         return {"map_image_path": output_path}
     except Exception as e:
-        traceback.print_exc()
         return {"error": f"Map Error: {str(e)}"}
 
 def expert_analyst_node(state: WildfireState):
-    """Generates a text report using an LLM."""
+    """Generates a text report with enriched location data."""
     llm = ChatOpenAI(model="gpt-4o", temperature=0.5)
 
-    # 1. Handle Error State
     if state.get("error"):
+        # ... (Error handling logic same as before)
         error_msg = state["error"]
         prompt = f"""
-        Você é um especialista em monitoramento de queimadas via satélite (GOES-16).
-        
-        Tivemos um problema ao processar os dados para a data: {state.get('date_query', 'Desconhecida')}.
-        Erro reportado: "{error_msg}"
-        
-        Sua tarefa é JUSTIFICAR esse erro para o usuário final em um parágrafo técnico.
-        - Se o erro for sobre "No data found", considere se a data solicitada (Ex: 2026) está no futuro ou se o dataset do satélite tem delay.
-        - Explique que o sistema tentou buscar no bucket AWS S3 'noaa-goes16', mas falhou.
-        
-        Termine com uma **Justificativa Metodológica** explicando que o acesso aos dados depende da disponibilidade no provedor (NOAA) e que datas futuras ou muito recentes podem ainda não ter sido processadas (latência de ingestão).
+        Você é um especialista em monitoramento de queimadas (GOES-16).
+        Problema na data: {state.get('date_query')}.
+        Erro: "{error_msg}".
+        Justifique tecnicamente para o usuário (ex: data futura, delay NOAA).
         """
         response = llm.invoke([HumanMessage(content=prompt)])
         return {"analyst_report": response.content, "error": None}
 
-    # 2. Handle Success State
-    # Safely get values, defaulting to 0/empty if somehow missing but no error flag
+    # Success
     count = state.get("confirmed_anomalies", 0)
-    raw = state.get("raw_anomalies", 0)
-    coords = state.get("fire_coordinates", [])[:5]
+    enriched = state.get("enriched_data", [])
+    
+    # Format the enriched data for the prompt
+    loc_details = ""
+    for item in enriched:
+        loc_details += f"- {item['city']} ({item['region']}): {item['temp_k']:.1f}K. Base mais próxima: {item['station']} (~{item['dist_km']}km).\n"
     
     prompt = f"""
-    Você é um especialista em monitoramento de queimadas via satélite (GOES-16).
+    Você é um Comandante Estratégico do Corpo de Bombeiros (CBMCE).
     
-    Dados da análise de hoje:
-    - Anomalias Brutas (Cluster Quente): {raw} (Muitos podem ser solo quente).
-    - Focos Confirmados (Filtro Térmico > 315K): {count}.
-    - Coordenadas de exemplo (Lat/Lon/Temp): {coords}
+    SITUAÇÃO ATUAL (Ceará - Satélite GOES-16):
+    - Total de Focos Confirmados (>315K): {count}
     
-    Gere um relatório técnico contendo:
+    DETALHAMENTO DOS FOCOS MAIS CRÍTICOS (Top 10):
+    {loc_details}
     
-    1. **Parecer Situacional**: 
-       - Analise a severidade com base nos focos confirmados.
-       - Recomende ações para a defesa civil.
+    Gere um relatório Operacional e Técnico:
+    
+    1. **Análise de Impacto e Mobilização**:
+       - Cite as cidades atingidas e as macrorregiões.
+       - Indique quais batalhões (bases) devem ser acionados prioritariamente pela proximidade.
+       - Estime o risco (Baixo/Médio/Crítico) baseado na temperatura e proximidade urbana.
        
-    2. **Justificativa Metodológica** (Obrigatório, abaixo do parecer):
-       - Explique que foi usada a técnica de **Aprendizado de Máquina Não-Supervisionado (K-Means)** para segmentar a imagem termal.
-       - Explique que um **Filtro Estatístico de Temperatura (>315K)** foi aplicado sobre o cluster quente para remover falsos positivos (solo aquecido vs fogo ativo).
-       - Caso haja erros ou 0 focos, analise se pode ser cobertura de nuvens ou ausência real de calor.
+    2. **Dados Técnicos**:
+       - Liste as coordenadas exatas dos focos críticos para envio de viaturas.
        
-    Mantenha o tom profissional e direto.
+    3. **Justificativa Metodológica** (Obrigatório):
+       - Satélite GOES-16 (Bandas 07/13).
+       - Algoritmo K-Means + Filtro Térmico (>315K).
+       - Geocodificação Reversa para identificar municípios.
+       - Cálculo Geodésico para roteamento da viatura mais próxima.
     """
     
     response = llm.invoke([HumanMessage(content=prompt)])
@@ -261,39 +335,29 @@ workflow = StateGraph(WildfireState)
 
 workflow.add_node("fetch_data", fetch_data_node)
 workflow.add_node("detect", refine_detection_node)
+workflow.add_node("enrich", enrich_location_node) # New Node
 workflow.add_node("map", map_generation_node)
 workflow.add_node("analyst", expert_analyst_node)
 
 workflow.set_entry_point("fetch_data")
 
 def should_process(state: WildfireState):
-    if state.get("error"):
-        return "analyst"
-    return "detect"
+    return "analyst" if state.get("error") else "detect"
+
+def should_enrich(state: WildfireState):
+    return "analyst" if state.get("error") else "enrich"
 
 def should_map(state: WildfireState):
-    if state.get("error"):
-        return "analyst"
-    return "map"
+    return "analyst" if state.get("error") else "map"
 
-workflow.add_conditional_edges("fetch_data", should_process, {
-    "analyst": "analyst",
-    "detect": "detect"
-})
-
-workflow.add_conditional_edges("detect", should_map, {
-    "analyst": "analyst",
-    "map": "map"
-})
+workflow.add_conditional_edges("fetch_data", should_process, {"analyst": "analyst", "detect": "detect"})
+workflow.add_conditional_edges("detect", should_enrich, {"analyst": "analyst", "enrich": "enrich"})
+workflow.add_conditional_edges("enrich", should_map, {"analyst": "analyst", "map": "map"})
 
 workflow.add_edge("map", "analyst")
 workflow.add_edge("analyst", END)
 
 app = workflow.compile()
 
-# --- EXPORT FOR DASHBOARD ---
 def run_agent(date_query: str):
-    """Entry point for the Dashboard."""
-    initial_state = {"date_query": date_query}
-    result = app.invoke(initial_state)
-    return result
+    return app.invoke({"date_query": date_query})
