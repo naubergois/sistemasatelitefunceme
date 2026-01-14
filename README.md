@@ -24,7 +24,7 @@ Este projeto é um sistema avançado de monitoramento de incêndios florestais f
 
 1.  **Clone o repositório:**
     ```bash
-    git clone https://github.com/seu-usuario/monitor-queimadas-ceara.git
+    git clone https://github.com/naubergois/sistemasatelitefunceme.git
     cd monitor-queimadas-ceara
     ```
 
