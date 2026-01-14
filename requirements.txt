@@ -1,0 +1,15 @@
+langchain
+langchain-openai
+langchain-community
+langchain-core
+boto3
+netCDF4
+matplotlib
+numpy
+python-dotenv
+pyproj
+scikit-learn
+streamlit
+langgraph
+geopandas
+shapely
