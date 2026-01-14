@@ -47,12 +47,26 @@ if st.sidebar.button("🚀 Iniciar Análise Especialista"):
                 
                 with col1:
                     st.subheader("Mapa de Situação")
-                    map_path = result.get("map_image_path")
-                    if map_path and os.path.exists(map_path):
-                        img = Image.open(map_path)
-                        st.image(img, caption="Focos Confirmados em Mapas Oficiais", use_column_width=True)
-                    else:
-                        st.warning("Mapa não gerado.")
+                    
+                    tab_static, tab_interactive = st.tabs(["🗺️ Estático", "🌍 Interativo (Folium)"])
+                    
+                    with tab_static:
+                        map_path = result.get("map_image_path")
+                        if map_path and os.path.exists(map_path):
+                            img = Image.open(map_path)
+                            st.image(img, caption="Focos Confirmados em Mapas Oficiais", use_column_width=True)
+                        else:
+                            st.warning("Mapa estático não gerado.")
+                            
+                    with tab_interactive:
+                        int_map_path = result.get("interactive_map_path")
+                        if int_map_path and os.path.exists(int_map_path):
+                            import streamlit.components.v1 as components
+                            with open(int_map_path, 'r', encoding='utf-8') as f:
+                                map_html = f.read()
+                            components.html(map_html, height=600, scrolling=False)
+                        else:
+                            st.info("Mapa interativo indisponível.")
                         
                 with col2:
                     st.subheader("Relatório & Justificativa")

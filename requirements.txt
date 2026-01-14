@@ -15,3 +15,5 @@ geopandas
 shapely
 geopy
 rtree
+folium
+streamlit-folium

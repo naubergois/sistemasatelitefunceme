@@ -61,6 +61,7 @@ class WildfireState(TypedDict):
     fire_coordinates: List[tuple] # [(lat, lon, temp), ...]
     enriched_data: List[dict] # [{lat, lon, city, region, station, dist_km}, ...]
     map_image_path: str
+    interactive_map_path: str
     analyst_report: str
     error: str
 
@@ -236,44 +237,114 @@ def enrich_location_node(state: WildfireState):
         return {"error": f"Enrichment Error: {str(e)}"}
 
 def map_generation_node(state: WildfireState):
-    """Generates the map using Geopandas."""
+    """Generates the map using Geopandas and Folium."""
+    import folium
+    from folium.plugins import HeatMap
+    
     if state.get("error"): return state
 
     try:
-        url = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima"
+        # 1. Download Ceará Municipalities (IBGE)
+        url = "https://servicodados.ibge.gov.br/api/v3/malhas/estados/CE?formato=application/vnd.geo+json&qualidade=minima&divisao=municipio"
         response = requests.get(url)
-        gdf_ce = gpd.read_file(io.BytesIO(response.content))
+        gdf_cities = gpd.read_file(io.BytesIO(response.content))
         
-        fig, ax = plt.subplots(figsize=(10, 8))
-        gdf_ce.plot(ax=ax, color='white', edgecolor='black')
+        # Ensure CRS is WGS84 for Folium
+        # IBGE GeoJSON API v3 returns coordinates in WGS84 (EPSG:4326)
+        if gdf_cities.crs is None:
+            gdf_cities.set_crs(epsg=4326, inplace=True)
+        else:
+            gdf_cities = gdf_cities.to_crs(epsg=4326)
         
-        # Plot Fire Points
+        # 2. Identify Impacted Cities per logic
         coords = state.get("fire_coordinates", [])
+        impacted_cities_indices = set()
+        
+        if coords:
+            points = [Point(c[1], c[0]) for c in coords] # lon, lat
+            gdf_fire = gpd.GeoDataFrame(geometry=points, crs="EPSG:4326")
+            joined = gpd.sjoin(gdf_fire, gdf_cities, how="inner", predicate="within")
+            impacted_cities_indices = set(joined.index_right.unique())
+            
+        # --- STATIC MAP (Matplotlib) ---
+        fig, ax = plt.subplots(figsize=(10, 8))
+        gdf_cities.plot(ax=ax, color='white', edgecolor='black', linewidth=0.3)
+        
+        if impacted_cities_indices:
+            impacted_gdf = gdf_cities.loc[list(impacted_cities_indices)]
+            impacted_gdf.plot(ax=ax, color='red', alpha=0.3, edgecolor='black', linewidth=0.3)
+            
         if coords:
             lats = [c[0] for c in coords]
             lons = [c[1] for c in coords]
-            ax.scatter(lons, lats, c='red', marker='x', s=50, label='Focos (>315K)')
+            ax.scatter(lons, lats, c='red', marker='x', s=50, label='Focos (>315K)', zorder=5)
             
-            # Also plot the nearest fire stations for the TOP 3 hottest (to avoid clutter)
             enriched = state.get("enriched_data", [])
             for item in enriched[:3]:
-                # Locate station coord
                 st_name = item['station']
                 if st_name in CBMCE_STATIONS:
                     slat, slon = CBMCE_STATIONS[st_name]
-                    ax.scatter(slon, slat, c='blue', marker='o', s=40)
-                    # Draw line
-                    ax.plot([item['lon'], slon], [item['lat'], slat], 'g--', linewidth=0.5, alpha=0.7)
+                    ax.scatter(slon, slat, c='blue', marker='o', s=40, zorder=5)
+                    ax.plot([item['lon'], slon], [item['lat'], slat], 'g--', linewidth=0.5, alpha=0.7, zorder=4)
             
-            plt.legend()
-            
-        ax.set_title(f"Queimadas Ceará + Unidades CBMCE\nFocos Confirmados: {state['confirmed_anomalies']}")
+        plt.legend(loc='lower right')
+        ax.set_title(f"Queimadas Ceará - Monitoramento Municipal\nFocos Confirmados: {state['confirmed_anomalies']}")
+        ax.axis('off')
         
-        output_path = "mapa_langgraph_ceara.png"
-        plt.savefig(output_path)
+        static_map_path = "mapa_langgraph_ceara.png"
+        plt.savefig(static_map_path, dpi=200)
         plt.close()
-        return {"map_image_path": output_path}
+        
+        # --- INTERACTIVE MAP (Folium) ---
+        # Center on Ceará
+        m = folium.Map(location=[-5.2, -39.5], zoom_start=7, tiles="CartoDB positron")
+        
+        # Layer 1: City Boundaries
+        folium.GeoJson(
+            data=gdf_cities.__geo_interface__, # Explicit serialization
+            name="Municípios",
+            style_function=lambda feature: {
+                'color': 'black',
+                'weight': 1.5,       # Slightly thicker to ensure visibility
+                'fillOpacity': 0.0,  # Transparent fill
+            }
+        ).add_to(m)
+        
+        # Layer 2: Fire Heatmap
+        if coords:
+            heat_data = [[c[0], c[1], (c[2] - 300) if c[2] > 300 else 0] for c in coords] # lat, lon, magnitude (temp - 300)
+            HeatMap(heat_data, name="Mapa de Calor (Fogo)", radius=15, blur=10).add_to(m)
+            
+            # Layer 3: Markers for Critical Points (Top 10)
+            enriched = state.get("enriched_data", [])
+            for item in enriched:
+                popup_html = f"""
+                <b>Cidade:</b> {item['city']}<br>
+                <b>Temp:</b> {item['temp_k']:.1f} K<br>
+                <b>Base:</b> {item['station']} ({item['dist_km']}km)
+                """
+                folium.Marker(
+                    location=[item['lat'], item['lon']],
+                    popup=folium.Popup(popup_html, max_width=300),
+                    icon=folium.Icon(color='red', icon='fire', prefix='fa')
+                ).add_to(m)
+
+        # Layer 4: Fire Stations
+        for name, (lat, lon) in CBMCE_STATIONS.items():
+            folium.Marker(
+                location=[lat, lon],
+                popup=name,
+                icon=folium.Icon(color='blue', icon='shield', prefix='fa')
+            ).add_to(m)
+            
+        folium.LayerControl().add_to(m)
+        
+        interactive_map_path = "mapa_interativo.html"
+        m.save(interactive_map_path)
+
+        return {"map_image_path": static_map_path, "interactive_map_path": interactive_map_path}
     except Exception as e:
+        traceback.print_exc()
         return {"error": f"Map Error: {str(e)}"}
 
 def expert_analyst_node(state: WildfireState):
